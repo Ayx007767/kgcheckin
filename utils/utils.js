@@ -33,19 +33,40 @@ async function waitForApi(base = 'http://127.0.0.1:3000', timeoutMs = 20000) {
 
 /** 启动 api 服务（detached 使其成为独立进程组，便于整组强杀） */
 function startService() {
-  const api = spawn('npm', ['run', 'apiService'], {
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  // 测试/调试钩子：设置 KUGOU_API_SERVICE_CMD 可直接指定服务启动命令，
+  // 便于在没有 npm 的环境或用 mock 服务验证主流程，生产环境不设置即走默认 npm 脚本。
+  const customCmd = process.env.KUGOU_API_SERVICE_CMD
+  let child
+  if (customCmd) {
+    child = spawn(customCmd, [], {
+      detached: false,
+      shell: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } else {
+    child = spawn('npm', ['run', 'apiService'], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  }
 
-  api.stdout.on('data', () => {})
-  api.stderr.on('data', data => {
-    const msg = String(data).trim()
+  // 以前只在 stderr 有内容时才打印，且 stdout 直接丢弃：
+  // 一旦 api 服务起不来（依赖没装、端口占用、npm 不存在），日志里只剩
+  // "子进程退出 code=1"，完全看不出原因。现在把子进程输出转发出来，并捕获 spawn 失败。
+  child.stdout.on('data', (data) => {
+    const msg = String(data).trimEnd()
+    if (msg) console.log('[api]', msg)
+  })
+  child.stderr.on('data', data => {
+    const msg = String(data).trimEnd()
     if (msg) console.log('[api stderr]', msg)
   })
-  api.on('close', code => console.log(`[api] 子进程退出，code=${code}`))
+  child.on('error', error => {
+    console.log(`[api] 启动失败：${error.code || ''} ${error.message}`)
+  })
+  child.on('close', code => console.log(`[api] 子进程退出，code=${code}`))
 
-  return api
+  return child
 }
 
 /**

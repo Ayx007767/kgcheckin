@@ -9,10 +9,22 @@ async function main() {
   const USERINFO = process.env.USERINFO
   // 刷新token
   let needRefresh = false
-  if (!USERINFO) {
-    throw new Error("未配置")
+  if (!USERINFO || !USERINFO.trim()) {
+    throw new Error("未配置 secret <USERINFO>（仓库 Settings → Secrets and variables → Actions 中添加）")
   }
-  const userinfo = JSON.parse(USERINFO)
+  // Secret 内容一旦被编辑器插入换行/BOM 或粘贴截断，裸 JSON.parse 会直接崩成 uncaught exception，
+  // 日志里只剩一段堆栈看不出原因，因此这里给出可操作的报错。
+  let userinfo
+  try {
+    userinfo = JSON.parse(USERINFO.trim())
+  } catch (error) {
+    throw new Error(
+      `secret <USERINFO> 不是合法 JSON（${error.message}）。正确格式示例：[{"userid":"12345678","token":"xxxxxxxx"}]`
+    )
+  }
+  if (!Array.isArray(userinfo) || userinfo.length === 0) {
+    throw new Error("secret <USERINFO> 必须是非空数组，示例：[{\"userid\":\"12345678\",\"token\":\"xxxxxxxx\"}]")
+  }
 
   // 启动服务并等待就绪（避免冷启动竞态导致首个请求失败）
   const api = startService()
@@ -44,33 +56,68 @@ async function main() {
       // 不影响其余账号继续执行，也保证后续通知与 secret 刷新一定能触发。
       try {
         let headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
-        const userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
-        if (userDetail?.data?.nickname == null) {
+        let userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
+
+        // 关键修复：以前只在「周日」自动刷新 token（today.getDay() === 0），
+        // 非周日一旦 token 失效就永远失败、只能手工重新扫码登录。
+        // 改为「探测到失效即刷新并重试」，刷新成功就继续领取，刷新失败才记为错误。
+        if (userDetail?.status !== 1 || userDetail?.data?.nickname == null) {
           const safeUserId = maskIdentifier(user.userid)
-          printRed(`token过期或账号不存在, userid: ${safeUserId}`)
-          errorMsg[safeUserId] = {
-            msg: `token过期或账号不存在, userid: ${safeUserId}`,
-            data: summarizeResponse(userDetail)
+          printYellow(`账号 ${safeUserId} token 可能已失效（error_code=${userDetail?.error_code ?? '无'}），尝试自动刷新...`)
+          let refreshed = false
+          try {
+            const refreshToken = await send(`/login/token?timestrap=${Date.now()}`, "POST", headers)
+            if (refreshToken?.status == 1 && refreshToken?.data?.token) {
+              if (refreshToken.data.token !== user.token) {
+                needRefresh = true
+                user.token = refreshToken.data.token
+                // 用新 token 重建 headers，使后续听歌/VIP 领取使用刷新后的凭证
+                headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+                printGreen(`账号 ${safeUserId} token 刷新成功`)
+              } else {
+                printYellow(`账号 ${safeUserId} token 未变化`)
+              }
+              refreshed = true
+            } else {
+              printRed(`账号 ${safeUserId} token 刷新失败（error_code=${refreshToken?.error_code ?? '无'}）`)
+            }
+          } catch (refreshErr) {
+            printRed(`账号 ${safeUserId} token 刷新请求异常：${refreshErr?.message ?? String(refreshErr)}`)
           }
-          notifyResults.push({
-            nickname: safeUserId,
-            status: '失败',
-            listen: '账号不存在',
-            vipClaim: '0/8',
-            vipExpiry: '未知',
-            error: 'token过期或账号不存在'
-          })
-          hasError = true
-          continue
+
+          if (refreshed) {
+            userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
+          }
+
+          if (userDetail?.status !== 1 || userDetail?.data?.nickname == null) {
+            printRed(`token过期或账号不存在, userid: ${safeUserId}`)
+            errorMsg[safeUserId] = {
+              msg: refreshed
+                ? `token已过期且自动刷新无效，请重新扫码登录, userid: ${safeUserId}`
+                : `token过期或账号不存在（自动刷新失败，通常是 refresh token 也过期了，需重新扫码登录）, userid: ${safeUserId}`,
+              data: summarizeResponse(userDetail)
+            }
+            notifyResults.push({
+              nickname: safeUserId,
+              status: '失败',
+              listen: '账号不存在',
+              vipClaim: '0/8',
+              vipExpiry: '未知',
+              error: 'token过期，需要重新扫码登录'
+            })
+            hasError = true
+            continue
+          }
+          printGreen(`账号 ${safeUserId} 刷新后校验通过`)
         }
         const safeNickname = maskDisplayName(userDetail.data.nickname)
         printMagenta(`账号 ${safeNickname} 开始领取VIP...`)
 
-        // 周日刷新token
+        // 周日额外刷新一次 token，延长轮换周期
         if (today.getDay() === 0) {
           const refreshToken = await send(`/login/token?timestrap=${Date.now()}`, "POST", headers)
           if (refreshToken?.status == 1) {
-            if (refreshToken?.data?.token !== user.token) {
+            if (refreshToken?.data?.token && refreshToken.data.token !== user.token) {
               needRefresh = true
               printYellow(`账号 ${safeNickname} 需要刷新token`)
               user.token = refreshToken.data.token
@@ -209,7 +256,19 @@ async function main() {
 
   if (Object.keys(errorMsg).length > 0) {
     printRed("异常信息如下:")
-    console.dir(sanitizeForLog(errorMsg), { depth: null })
+    // 以前用 console.dir(..., { depth: null }) 打印，Actions 日志会把整段对象压成一行，
+    // annotation 因此只指向一行、无法定位。改为逐条分行输出，中文不乱码、便于搜索。
+    for (const [scope, detail] of Object.entries(sanitizeForLog(errorMsg))) {
+      printRed(`  · [${scope}] ${detail?.msg ?? ''}`)
+      const data = detail?.data
+      if (data !== undefined) {
+        const flat = typeof data === 'object' ? JSON.stringify(data) : String(data)
+        printRed(`      ↳ 接口返回: ${flat}`)
+      }
+      if (detail?.error) {
+        printRed(`      ↳ 异常: ${detail.error}`)
+      }
+    }
     throw new Error("领取异常")
   }
 
